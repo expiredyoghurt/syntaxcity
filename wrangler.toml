@@ -3,5 +3,5 @@ compatibility_date = "2026-08-14"
 pages_build_output_dir = "."
 
 [[kv_namespaces]]
-binding = "SYNTAXCITY_DATA"
-id = "c0bd280cf7bb48d487a8fa3e93cef33d"
+binding = "CITY_DATA"
+id = "d5c5b256d51d4c84bd14376beac12997"
