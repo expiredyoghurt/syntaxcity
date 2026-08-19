@@ -1,0 +1,7 @@
+name = "syntaxcity"
+compatibility_date = "2026-08-14"
+pages_build_output_dir = "."
+
+[[kv_namespaces]]
+binding = "CITY_DATA"
+id = "624ebffd937f4575b4ac7bc38a6cc87e"
