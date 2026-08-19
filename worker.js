@@ -2,28 +2,10 @@
  * PSLE City Builder — Backend Worker
  * -----------------------------------
  * Deploy this to Cloudflare Workers (with a KV namespace bound as SYNTAXCITY_DATA)
- * to give the game real cross-device accounts, city saves, and a shared
- * leaderboard. Once deployed, paste the Worker's URL into the API_BASE
- * constant near the top of citybuilder.html.
- *
- * KV layout (single namespace, prefixed keys):
- *   account:<lowercase-username>  -> { username, password, game }
- *   leaderboard                   -> [ { name, population, era, money, buildings,
- *                                        correct, attempted, ts }, ... ]
- *
- * Routes:
- *   POST /api/register             { username, password }
- *   POST /api/login                 { username, password }
- *   POST /api/save                  { username, password, game }
- *   GET  /api/admin/player?name=x    (header X-Admin-Passcode: simcity)
- *   POST /api/admin/player           { name, game }  (header X-Admin-Passcode: simcity)
- *   GET  /leaderboard
- *   POST /leaderboard                { name, population, era, money, buildings, correct, attempted }
- *   POST /leaderboard/reset          (header X-Admin-Passcode: simcity)
+ * Set secret environment variable ADMIN_PASSCODE in Cloudflare Dashboard.
  */
 
 const GRID_SIZE = 20;
-const ADMIN_PASSCODE = 'simcity';
 const MAX_LEADERBOARD_ENTRIES = 200;
 
 function corsHeaders() {
@@ -39,6 +21,16 @@ function jsonResponse(data, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json', ...corsHeaders() },
   });
+}
+
+// Secure SHA-256 password hashing via Web Crypto API
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
 }
 
 function defaultGameState() {
@@ -66,6 +58,7 @@ async function readAccount(env, username) {
   if (!raw) return null;
   try { return JSON.parse(raw); } catch (e) { return null; }
 }
+
 async function writeAccount(env, account) {
   await env.SYNTAXCITY_DATA.put(accountKey(account.username), JSON.stringify(account));
 }
@@ -76,12 +69,14 @@ async function readLeaderboard(env) {
   try { const parsed = JSON.parse(raw); return Array.isArray(parsed) ? parsed : []; }
   catch (e) { return []; }
 }
+
 async function writeLeaderboard(env, entries) {
   await env.SYNTAXCITY_DATA.put('leaderboard', JSON.stringify(entries));
 }
 
-function checkAdminPasscode(request) {
-  return request.headers.get('X-Admin-Passcode') === ADMIN_PASSCODE;
+function checkAdminPasscode(request, env) {
+  const expectedPasscode = env.ADMIN_PASSCODE || 'simcity';
+  return request.headers.get('X-Admin-Passcode') === expectedPasscode;
 }
 
 export default {
@@ -102,7 +97,8 @@ export default {
       const existing = await readAccount(env, body.username);
       if (existing) return jsonResponse({ error: 'That mayor name is already taken.' }, 409);
 
-      const account = { username: body.username, password: body.password, game: defaultGameState() };
+      const hashedPassword = await hashPassword(body.password);
+      const account = { username: body.username, password: hashedPassword, game: defaultGameState() };
       await writeAccount(env, account);
       return jsonResponse({ game: account.game });
     }
@@ -113,7 +109,8 @@ export default {
         return jsonResponse({ error: 'A username and password are required.' }, 400);
       }
       const account = await readAccount(env, body.username);
-      if (!account || account.password !== body.password) {
+      const inputHash = await hashPassword(body.password);
+      if (!account || account.password !== inputHash) {
         return jsonResponse({ error: 'Mayor name and City Key do not match.' }, 401);
       }
       return jsonResponse({ game: account.game });
@@ -125,7 +122,8 @@ export default {
         return jsonResponse({ error: 'Missing username, password, or game data.' }, 400);
       }
       const account = await readAccount(env, body.username);
-      if (!account || account.password !== body.password) {
+      const inputHash = await hashPassword(body.password);
+      if (!account || account.password !== inputHash) {
         return jsonResponse({ error: 'Mayor name and City Key do not match.' }, 401);
       }
       account.game = body.game;
@@ -135,7 +133,7 @@ export default {
 
     // ---------------- Admin (teacher tools) ----------------
     if (path === '/api/admin/player' && request.method === 'GET') {
-      if (!checkAdminPasscode(request)) return jsonResponse({ error: 'Incorrect admin passcode.' }, 403);
+      if (!checkAdminPasscode(request, env)) return jsonResponse({ error: 'Incorrect admin passcode.' }, 403);
       const name = url.searchParams.get('name');
       if (!name) return jsonResponse({ error: 'A mayor name is required.' }, 400);
       const account = await readAccount(env, name);
@@ -144,7 +142,7 @@ export default {
     }
 
     if (path === '/api/admin/player' && request.method === 'POST') {
-      if (!checkAdminPasscode(request)) return jsonResponse({ error: 'Incorrect admin passcode.' }, 403);
+      if (!checkAdminPasscode(request, env)) return jsonResponse({ error: 'Incorrect admin passcode.' }, 403);
       const body = await readJsonBody(request);
       if (!body || !body.name || !body.game) return jsonResponse({ error: 'A mayor name and game data are required.' }, 400);
       const account = await readAccount(env, body.name);
@@ -163,7 +161,17 @@ export default {
 
     if (path === '/leaderboard' && request.method === 'POST') {
       const body = await readJsonBody(request);
-      if (!body || !body.name) return jsonResponse({ error: 'A mayor name is required.' }, 400);
+      if (!body || !body.name || !body.password) {
+        return jsonResponse({ error: 'Mayor name and password are required.' }, 400);
+      }
+      
+      // Verify credentials before writing to leaderboard
+      const account = await readAccount(env, body.name);
+      const inputHash = await hashPassword(body.password);
+      if (!account || account.password !== inputHash) {
+        return jsonResponse({ error: 'Unauthorized submission.' }, 401);
+      }
+
       const entry = {
         name: String(body.name).trim().slice(0, 40),
         population: Math.max(0, Math.min(100000, Number(body.population) || 0)),
@@ -174,6 +182,7 @@ export default {
         attempted: Math.max(0, Math.min(1000000, Number(body.attempted) || 0)),
         ts: Date.now(),
       };
+
       let entries = await readLeaderboard(env);
       entries = entries.filter((e) => e.name.toLowerCase() !== entry.name.toLowerCase());
       entries.push(entry);
@@ -184,7 +193,7 @@ export default {
     }
 
     if (path === '/leaderboard/reset' && request.method === 'POST') {
-      if (!checkAdminPasscode(request)) return jsonResponse({ error: 'Incorrect admin passcode.' }, 403);
+      if (!checkAdminPasscode(request, env)) return jsonResponse({ error: 'Incorrect admin passcode.' }, 403);
       await writeLeaderboard(env, []);
       return jsonResponse({ ok: true, message: 'Leaderboard cleared.' });
     }
